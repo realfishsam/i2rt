@@ -31,6 +31,7 @@ _BTN_RADIUS = 0.022
 # World-vertical offsets (meters along +Z) above the TCP. Index 0 = SYNC (top), 1 = RECORD (bottom).
 _BTN_Z_OFFSETS = [0.10, 0.04]
 _BTN_LABELS = ["SYNC", "RECORD"]
+_RESET_RAMP_S = 2.0  # seconds to glide from current pose to home on /reset
 
 
 class ViserControlInterface:
@@ -481,10 +482,11 @@ class ViserControlInterface:
 
         # ---- Local bridge (OneShotRobot) --------------------------------------
         # Minimal HTTP endpoint so the web UI can request a reset-to-home.
+        import json
         import threading
         from http.server import BaseHTTPRequestHandler, HTTPServer
 
-        bridge = {"reset": False}
+        bridge: Dict[str, Any] = {"reset": False, "snapshot": None}
 
         class _BridgeHandler(BaseHTTPRequestHandler):
             def _cors(self) -> None:
@@ -504,6 +506,13 @@ class ViserControlInterface:
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
                     self.wfile.write(body)
+                elif self.path == "/joints":
+                    snap = bridge["snapshot"]
+                    self.send_response(200 if snap is not None else 503)
+                    self._cors()
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps(snap).encode() if snap is not None else b'{"error": "no data yet"}')
                 else:
                     self.send_response(404)
                     self._cors()
@@ -535,21 +544,48 @@ class ViserControlInterface:
 
         # ---- Main loop -------------------------------------------------------
         prev_controlled = False
+        reset_anim: dict | None = None
         try:
             while True:
                 if bridge["reset"]:
                     bridge["reset"] = False
                     if state["enabled"]:
                         mode_dd.value = "Joint sliders"
-                        for s in joint_sliders:
-                            s.value = 0.0
-                        if gripper_slider is not None:
-                            gripper_slider.value = 0.0
-                        print("[bridge] Reset to home pose")
+                        q = self._robot.get_joint_pos()
+                        reset_anim = {
+                            "step": 0,
+                            "steps": max(1, int(_RESET_RAMP_S / self._dt)),
+                            "start_deg": [float(np.degrees(q[i])) if i < len(q) else 0.0 for i in range(len(joint_sliders))],
+                            "grip_start": float(q[self._gripper_index]) if gripper_slider is not None and self._gripper_index is not None else 0.0,
+                        }
+                        print(f"[bridge] Ramping to home pose over {_RESET_RAMP_S}s")
                     else:
                         print("[bridge] Reset ignored — robot disabled")
+
+                if reset_anim is not None:
+                    if not state["enabled"] or state["mode"] != "joint":
+                        reset_anim = None  # user took over — stop ramping
+                    else:
+                        reset_anim["step"] += 1
+                        a = min(1.0, reset_anim["step"] / reset_anim["steps"])
+                        # ponytail: linear ramp of slider targets; PD smooths the rest
+                        for i, s in enumerate(joint_sliders):
+                            s.value = reset_anim["start_deg"][i] * (1.0 - a)
+                        if gripper_slider is not None:
+                            gripper_slider.value = reset_anim["grip_start"] * (1.0 - a)
+                        if a >= 1.0:
+                            reset_anim = None
+                            print("[bridge] Home pose reached")
                 self._mirror_robot()
                 self._update_scene(mesh_handles)
+
+                # Publish latest joint snapshot for the bridge's GET /joints
+                q_now = self._robot.get_joint_pos()
+                bridge["snapshot"] = {
+                    "t": time.time(),
+                    "joints": [float(v) for v in q_now[: self._n_arm]],
+                    "gripper": float(q_now[self._gripper_index]) if self._gripper_index is not None else 0.0,
+                }
 
                 # Update EE frame indicator
                 T = self._ee_pose_4x4()
