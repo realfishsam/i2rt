@@ -617,7 +617,8 @@ class ViserControlInterface:
                     except (TypeError, KeyError, ValueError):
                         self._json(400, {"ok": False, "error": "body must be {x, y, z}"})
                         return
-                    if not state["enabled"]:
+                    # bridge["enable"] covers the gap between POST /enable and the loop consuming it
+                    if not (state["enabled"] or bridge["enable"]):
                         self._json(409, {"ok": False, "error": "robot disabled"})
                         return
                     bridge["move_to"] = target
@@ -629,7 +630,7 @@ class ViserControlInterface:
                     except (TypeError, KeyError, ValueError):
                         self._json(400, {"ok": False, "error": "body must be {position: 0..1}"})
                         return
-                    if not state["enabled"]:
+                    if not (state["enabled"] or bridge["enable"]):
                         self._json(409, {"ok": False, "error": "robot disabled"})
                         return
                     bridge["gripper"] = float(np.clip(pos, 0.0, 1.0))
