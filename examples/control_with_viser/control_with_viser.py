@@ -10,8 +10,13 @@ Usage:
     python examples/control_with_viser/control_with_viser.py --channel can0
 """
 
+import os
 import sys
 from pathlib import Path
+
+# default GLFW backend is flaky for offscreen bridge-camera renders on macOS; CGL is windowless and reliable
+if sys.platform == "darwin":
+    os.environ.setdefault("MUJOCO_GL", "cgl")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 

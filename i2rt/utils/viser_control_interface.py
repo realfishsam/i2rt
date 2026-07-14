@@ -748,8 +748,15 @@ class ViserControlInterface:
                 # Service camera snapshot requests (render on this thread — GL context affinity)
                 if bridge["cam_req"]:
                     if renderer is None:
-                        renderer = mujoco.Renderer(self._model, height=480, width=640)
-                    for cam_name, ev in list(bridge["cam_req"].items()):
+                        try:
+                            renderer = mujoco.Renderer(self._model, height=480, width=640)
+                        except Exception as exc:
+                            print(f"[bridge] camera renderer init failed: {exc}")
+                            for cam_name, ev in list(bridge["cam_req"].items()):
+                                bridge["cam_req"].pop(cam_name, None)
+                                bridge["cam_jpg"][cam_name] = None
+                                ev.set()
+                    for cam_name, ev in list(bridge["cam_req"].items()) if renderer is not None else []:
                         bridge["cam_req"].pop(cam_name, None)
                         try:
                             renderer.update_scene(self._data, camera=cam_name)

@@ -246,7 +246,9 @@ def get_yam_robot(
         ET.SubElement(scene_wb, "camera", name="overhead", pos="0.30 0 0.9", xyaxes="0 -1 0 1 0 0", fovy="55")
         gripper_body = scene_tree.getroot().find(".//body[@name='gripper']")
         if gripper_body is not None:
-            ET.SubElement(gripper_body, "camera", name="wrist", pos="0 -0.12 0.02", xyaxes="1 0 0 0 0.79 0.612", fovy="75")
+            # finger (+Y) side of the mount, pitched at grasp_site (0,0,-0.1347) so the
+            # gap between the fingertips stays centered in frame
+            ET.SubElement(gripper_body, "camera", name="wrist", pos="0 0.13 0.06", xyaxes="1 0 0 0 0.832 -0.555", fovy="75")
         model_path = model_path.replace(".xml", "_scene.xml")
         scene_tree.write(model_path)
 
