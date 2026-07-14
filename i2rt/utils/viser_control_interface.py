@@ -286,6 +286,8 @@ class ViserControlInterface:
         import viser  # optional dependency — install with: pip install viser
 
         server = viser.ViserServer(port=self._port)
+        # local patch: minimal chrome so OneShotRobot can embed this as a clean viewport
+        server.gui.configure_theme(control_layout="collapsible", show_logo=False, show_share_button=False)
         print(f"[viser] Server started — open http://localhost:{self._port} in your browser")
         print("[viser] Starting in DISABLED (read-only) mode")
         print("[viser] Confirm robot alignment, then click 'Enable Robot'")
