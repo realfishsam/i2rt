@@ -479,10 +479,75 @@ class ViserControlInterface:
                 self._kd = new_kd
                 print(f"[viser] Gains applied: kp={new_kp.tolist()}, kd={new_kd.tolist()}")
 
+        # ---- Local bridge (OneShotRobot) --------------------------------------
+        # Minimal HTTP endpoint so the web UI can request a reset-to-home.
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        bridge = {"reset": False}
+
+        class _BridgeHandler(BaseHTTPRequestHandler):
+            def _cors(self) -> None:
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+
+            def do_OPTIONS(self) -> None:  # noqa: N802
+                self.send_response(204)
+                self._cors()
+                self.end_headers()
+
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path == "/status":
+                    body = ('{"enabled": ' + ("true" if state["enabled"] else "false") + ', "mode": "' + state["mode"] + '"}').encode()
+                    self.send_response(200)
+                    self._cors()
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    self.send_response(404)
+                    self._cors()
+                    self.end_headers()
+
+            def do_POST(self) -> None:  # noqa: N802
+                if self.path == "/reset":
+                    bridge["reset"] = True
+                    ok = state["enabled"]
+                    self.send_response(200 if ok else 409)
+                    self._cors()
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"ok": true}' if ok else b'{"ok": false, "error": "robot disabled"}')
+                else:
+                    self.send_response(404)
+                    self._cors()
+                    self.end_headers()
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+        try:
+            _bridge_srv = HTTPServer(("127.0.0.1", self._port + 1), _BridgeHandler)
+            threading.Thread(target=_bridge_srv.serve_forever, daemon=True).start()
+            print(f"[bridge] Reset endpoint on http://127.0.0.1:{self._port + 1}")
+        except OSError:
+            print("[bridge] Port busy — bridge disabled")
+
         # ---- Main loop -------------------------------------------------------
         prev_controlled = False
         try:
             while True:
+                if bridge["reset"]:
+                    bridge["reset"] = False
+                    if state["enabled"]:
+                        mode_dd.value = "Joint sliders"
+                        for s in joint_sliders:
+                            s.value = 0.0
+                        if gripper_slider is not None:
+                            gripper_slider.value = 0.0
+                        print("[bridge] Reset to home pose")
+                    else:
+                        print("[bridge] Reset ignored — robot disabled")
                 self._mirror_robot()
                 self._update_scene(mesh_handles)
 
