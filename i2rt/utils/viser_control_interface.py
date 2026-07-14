@@ -62,6 +62,15 @@ class ViserControlInterface:
         self._nq = self._model.nq
         self._n_arm = sum(1 for j in range(self._model.njnt) if self._model.jnt_type[j] == mujoco.mjtJoint.mjJNT_HINGE)
 
+        # Free-joint bodies (the sim cube): stepped with real physics in
+        # _mirror_robot, ignored by the self-collision check.
+        free = [j for j in range(self._model.njnt) if self._model.jnt_type[j] == mujoco.mjtJoint.mjJNT_FREE]
+        self._free_qpos_start = min((int(self._model.jnt_qposadr[j]) for j in free), default=self._model.nq)
+        self._robot_nv = min((int(self._model.jnt_dofadr[j]) for j in free), default=self._model.nv)
+        self._has_free_bodies = bool(free)
+        self._free_body_ids = {int(self._model.jnt_bodyid[j]) for j in free}
+        self._n_substeps = max(1, round(dt / self._model.opt.timestep))
+
         self._ee_site_id = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_SITE, ee_site)
         if self._ee_site_id == -1:
             available = [mujoco.mj_id2name(self._model, mujoco.mjtObj.mjOBJ_SITE, i) for i in range(self._model.nsite)]
@@ -79,6 +88,7 @@ class ViserControlInterface:
 
         # Mesh data — filled by _collect_mesh_geoms()
         self._mesh_geom_ids: List[int] = []
+        self._box_geom_ids: List[int] = []
         self._mesh_local_verts: Dict[int, np.ndarray] = {}
         self._mesh_local_faces: Dict[int, np.ndarray] = {}
 
@@ -104,6 +114,18 @@ class ViserControlInterface:
         self._data.qpos[:n] = qpos[:n]
         self._denormalize_slide_joints(n)
         self._enforce_eq_constraints()
+        if self._has_free_bodies:
+            # ponytail: arm is pinned to the robot's reported pose each substep
+            # (kinematic pusher); only free bodies integrate. Grasping via
+            # friction is weak under teleported contacts — good enough to
+            # touch/push; revisit with torque-driven sim if it matters.
+            pinned = self._data.qpos[: self._free_qpos_start].copy()
+            for _ in range(self._n_substeps):
+                self._data.qpos[: self._free_qpos_start] = pinned
+                self._data.qvel[: self._robot_nv] = 0.0
+                mujoco.mj_step(self._model, self._data)
+            self._data.qpos[: self._free_qpos_start] = pinned
+            self._data.qvel[: self._robot_nv] = 0.0
         mujoco.mj_forward(self._model, self._data)
 
     def _denormalize_slide_joints(self, n_set: int) -> None:
@@ -154,6 +176,8 @@ class ViserControlInterface:
                 continue
             b1 = self._model.geom_bodyid[c.geom1]
             b2 = self._model.geom_bodyid[c.geom2]
+            if b1 in self._free_body_ids or b2 in self._free_body_ids:
+                continue
             if self._model.body_parentid[b1] == b2 or self._model.body_parentid[b2] == b1:
                 continue
             return True
@@ -229,11 +253,23 @@ class ViserControlInterface:
                 wxyz=np.array([1.0, 0.0, 0.0, 0.0]),
                 position=np.zeros(3),
             )
+        for geom_id in range(self._model.ngeom):
+            if self._model.geom_type[geom_id] != mujoco.mjtGeom.mjGEOM_BOX:
+                continue
+            rgba = self._model.geom_rgba[geom_id]
+            self._box_geom_ids.append(geom_id)
+            handles[geom_id] = server.scene.add_box(
+                f"robot/geom_{geom_id}",
+                color=tuple(int(c * 255) for c in rgba[:3]),
+                dimensions=tuple(float(v) * 2.0 for v in self._model.geom_size[geom_id]),
+                wxyz=np.array([1.0, 0.0, 0.0, 0.0]),
+                position=np.zeros(3),
+            )
         return handles
 
     def _update_scene(self, handles: Dict[int, Any]) -> None:
         """Refresh mesh transforms from current MuJoCo forward-kinematics state."""
-        for geom_id in self._mesh_geom_ids:
+        for geom_id in self._mesh_geom_ids + self._box_geom_ids:
             h = handles[geom_id]
             h.position = self._data.geom_xpos[geom_id].copy()
             h.wxyz = self._mat3_to_wxyz(self._data.geom_xmat[geom_id])

@@ -225,6 +225,26 @@ def get_yam_robot(
     if sim:
         from i2rt.robots.sim_robot import SimRobot
 
+        # ponytail: sim-only scene dressing — floor + a light graspable cube so
+        # the arm has something to touch; real hardware loads the plain model
+        scene_tree = ET.parse(model_path)
+        scene_wb = scene_tree.getroot().find("worldbody")
+        ET.SubElement(scene_wb, "geom", name="floor", type="plane", size="2 2 0.1", rgba="0.92 0.92 0.92 1")
+        cube = ET.SubElement(scene_wb, "body", name="cube", pos="0.35 0.0 0.015")
+        ET.SubElement(cube, "joint", name="cube_free", type="free", damping="0.05")
+        ET.SubElement(
+            cube,
+            "geom",
+            name="cube_geom",
+            type="box",
+            size="0.015 0.015 0.015",
+            mass="0.05",
+            rgba="1.0 0.15 0.15 1",
+            friction="1 0.005 0.0001",
+        )
+        model_path = model_path.replace(".xml", "_scene.xml")
+        scene_tree.write(model_path)
+
         # In sim mode, grippers that need calibration have no limits yet — use [0, 1] default.
         sim_gripper_limits = gripper_limits
         if with_gripper and sim_gripper_limits is None:
