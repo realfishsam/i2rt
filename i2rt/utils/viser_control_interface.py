@@ -518,16 +518,45 @@ class ViserControlInterface:
 
         # ---- Local bridge (OneShotRobot) --------------------------------------
         # Minimal HTTP endpoint so the web UI can request a reset-to-home.
+        import io
         import json
         import threading
-        from http.server import BaseHTTPRequestHandler, HTTPServer
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-        bridge: Dict[str, Any] = {"reset": False, "snapshot": None}
+        from PIL import Image as PILImage
+
+        bridge: Dict[str, Any] = {
+            "reset": False,
+            "snapshot": None,
+            "enable": False,
+            "move_to": None,
+            "gripper": None,
+            "cam_req": {},
+            "cam_jpg": {},
+            "ee": None,
+        }
+        is_sim = self._is_sim
+        _CAMERAS = ("overhead", "wrist")
 
         class _BridgeHandler(BaseHTTPRequestHandler):
             def _cors(self) -> None:
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+
+            def _json(self, code: int, obj: Dict[str, Any]) -> None:
+                self.send_response(code)
+                self._cors()
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(obj).encode())
+
+            def _body(self) -> Optional[Dict[str, Any]]:
+                try:
+                    length = int(self.headers.get("Content-Length", 0))
+                    parsed = json.loads(self.rfile.read(length))
+                    return parsed if isinstance(parsed, dict) else None
+                except (ValueError, KeyError):
+                    return None
 
             def do_OPTIONS(self) -> None:  # noqa: N802
                 self.send_response(204)
@@ -549,13 +578,63 @@ class ViserControlInterface:
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
                     self.wfile.write(json.dumps(snap).encode() if snap is not None else b'{"error": "no data yet"}')
+                elif self.path == "/ee_pose":
+                    ee = bridge["ee"]
+                    self._json(200 if ee is not None else 503, ee if ee is not None else {"error": "no data yet"})
+                elif self.path.startswith("/camera/"):
+                    name = self.path.rsplit("/", 1)[1]
+                    if name not in _CAMERAS:
+                        self._json(404, {"error": f"unknown camera {name!r}"})
+                        return
+                    ev = threading.Event()
+                    bridge["cam_req"][name] = ev
+                    jpg = bridge["cam_jpg"].get(name) if ev.wait(2.0) else None
+                    if jpg:
+                        self.send_response(200)
+                        self._cors()
+                        self.send_header("Content-Type", "image/jpeg")
+                        self.send_header("Content-Length", str(len(jpg)))
+                        self.end_headers()
+                        self.wfile.write(jpg)
+                    else:
+                        self._json(503, {"error": "render unavailable"})
                 else:
                     self.send_response(404)
                     self._cors()
                     self.end_headers()
 
             def do_POST(self) -> None:  # noqa: N802
-                if self.path == "/reset":
+                if self.path == "/enable":
+                    if not is_sim:
+                        self._json(403, {"ok": False, "error": "enable via GUI on real hardware"})
+                    else:
+                        bridge["enable"] = True
+                        self._json(200, {"ok": True})
+                elif self.path == "/move_to":
+                    body = self._body()
+                    try:
+                        target = [float(body["x"]), float(body["y"]), float(body["z"])]  # type: ignore[index]
+                    except (TypeError, KeyError, ValueError):
+                        self._json(400, {"ok": False, "error": "body must be {x, y, z}"})
+                        return
+                    if not state["enabled"]:
+                        self._json(409, {"ok": False, "error": "robot disabled"})
+                        return
+                    bridge["move_to"] = target
+                    self._json(202, {"ok": True})
+                elif self.path == "/gripper":
+                    body = self._body()
+                    try:
+                        pos = float(body["position"])  # type: ignore[index]
+                    except (TypeError, KeyError, ValueError):
+                        self._json(400, {"ok": False, "error": "body must be {position: 0..1}"})
+                        return
+                    if not state["enabled"]:
+                        self._json(409, {"ok": False, "error": "robot disabled"})
+                        return
+                    bridge["gripper"] = float(np.clip(pos, 0.0, 1.0))
+                    self._json(200, {"ok": True})
+                elif self.path == "/reset":
                     bridge["reset"] = True
                     ok = state["enabled"]
                     self.send_response(200 if ok else 409)
@@ -572,7 +651,7 @@ class ViserControlInterface:
                 pass
 
         try:
-            _bridge_srv = HTTPServer(("127.0.0.1", self._port + 1), _BridgeHandler)
+            _bridge_srv = ThreadingHTTPServer(("127.0.0.1", self._port + 1), _BridgeHandler)
             threading.Thread(target=_bridge_srv.serve_forever, daemon=True).start()
             print(f"[bridge] Reset endpoint on http://127.0.0.1:{self._port + 1}")
         except OSError:
@@ -581,8 +660,41 @@ class ViserControlInterface:
         # ---- Main loop -------------------------------------------------------
         prev_controlled = False
         reset_anim: dict | None = None
+        renderer: Optional[mujoco.Renderer] = None
         try:
             while True:
+                if bridge["enable"]:
+                    bridge["enable"] = False
+                    if not state["enabled"]:
+                        state["enabled"] = True
+                        align_cb.disabled = True
+                        enable_btn.disabled = True
+                        status_md.content = "**Status:** ENABLED"
+                        mode_dd.disabled = False
+                        print("[bridge] Robot ENABLED via bridge")
+                        q = self._robot.get_joint_pos()
+                        for i, s in enumerate(joint_sliders):
+                            if i < len(q):
+                                s.value = float(np.degrees(q[i]))
+                        if gripper_slider is not None and self._gripper_index is not None:
+                            gripper_slider.value = float(q[self._gripper_index])
+
+                move_target = bridge["move_to"]
+                bridge["move_to"] = None
+                if move_target is not None and state["enabled"]:
+                    if mode_dd.value != "IK control":
+                        mode_dd.value = "IK control"  # fires on_update: gizmo shown, snapped to current EE
+                    ik_ctrl.position = np.array(move_target)
+                    print(f"[bridge] move_to {move_target}")
+
+                grip_target = bridge["gripper"]
+                bridge["gripper"] = None
+                if grip_target is not None and state["enabled"]:
+                    if mode_dd.value != "IK control":
+                        mode_dd.value = "IK control"
+                    if gripper_slider is not None:
+                        gripper_slider.value = grip_target
+
                 if bridge["reset"]:
                     bridge["reset"] = False
                     if state["enabled"]:
@@ -627,6 +739,27 @@ class ViserControlInterface:
                 T = self._ee_pose_4x4()
                 ee_frame.position = T[:3, 3]
                 ee_frame.wxyz = self._mat3_to_wxyz(T[:3, :3])
+                bridge["ee"] = {
+                    "t": time.time(),
+                    "pos": [float(v) for v in T[:3, 3]],
+                    "wxyz": [float(v) for v in self._mat3_to_wxyz(T[:3, :3])],
+                }
+
+                # Service camera snapshot requests (render on this thread — GL context affinity)
+                if bridge["cam_req"]:
+                    if renderer is None:
+                        renderer = mujoco.Renderer(self._model, height=480, width=640)
+                    for cam_name, ev in list(bridge["cam_req"].items()):
+                        bridge["cam_req"].pop(cam_name, None)
+                        try:
+                            renderer.update_scene(self._data, camera=cam_name)
+                            buf = io.BytesIO()
+                            PILImage.fromarray(renderer.render()).save(buf, "JPEG", quality=85)
+                            bridge["cam_jpg"][cam_name] = buf.getvalue()
+                        except Exception as exc:
+                            print(f"[bridge] camera {cam_name} render failed: {exc}")
+                            bridge["cam_jpg"][cam_name] = None
+                        ev.set()
 
                 if self._with_teaching_handle:
                     handle_state = self._get_teaching_handle_state()

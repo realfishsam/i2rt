@@ -242,6 +242,11 @@ def get_yam_robot(
             rgba="1.0 0.15 0.15 1",
             friction="1 0.005 0.0001",
         )
+        ET.SubElement(scene_wb, "light", name="toplight", pos="0.3 0.2 1.5", dir="0 0 -1", diffuse="0.45 0.45 0.45", specular="0.1 0.1 0.1")
+        ET.SubElement(scene_wb, "camera", name="overhead", pos="0.30 0 0.9", xyaxes="0 -1 0 1 0 0", fovy="55")
+        gripper_body = scene_tree.getroot().find(".//body[@name='gripper']")
+        if gripper_body is not None:
+            ET.SubElement(gripper_body, "camera", name="wrist", pos="0 -0.12 0.02", xyaxes="1 0 0 0 0.79 0.612", fovy="75")
         model_path = model_path.replace(".xml", "_scene.xml")
         scene_tree.write(model_path)
 
