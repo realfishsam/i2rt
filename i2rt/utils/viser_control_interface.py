@@ -32,6 +32,7 @@ _BTN_RADIUS = 0.022
 _BTN_Z_OFFSETS = [0.10, 0.04]
 _BTN_LABELS = ["SYNC", "RECORD"]
 _RESET_RAMP_S = 2.0  # seconds to glide from current pose to home on /reset
+_MOVE_SPEED_MPS = 0.25  # cartesian glide speed for /move_to — approximates real-arm pace instead of teleporting
 
 
 class ViserControlInterface:
@@ -736,6 +737,7 @@ class ViserControlInterface:
         # ---- Main loop -------------------------------------------------------
         prev_controlled = False
         reset_anim: dict | None = None
+        move_glide: Optional[np.ndarray] = None  # pending /move_to target the gizmo glides toward
         renderer: Optional[mujoco.Renderer] = None
         pose_data: Optional[mujoco.MjData] = None
         pose_cam: Optional[mujoco.MjvCamera] = None
@@ -763,8 +765,22 @@ class ViserControlInterface:
                 if move_target is not None and state["enabled"]:
                     if mode_dd.value != "IK control":
                         mode_dd.value = "IK control"  # fires on_update: gizmo shown, snapped to current EE
-                    ik_ctrl.position = np.array(move_target)
-                    print(f"[bridge] move_to {move_target}")
+                    move_glide = np.array(move_target)
+                    print(f"[bridge] move_to {move_target} (gliding at {_MOVE_SPEED_MPS} m/s)")
+
+                if move_glide is not None:
+                    if not state["enabled"] or state["mode"] != "ik":
+                        move_glide = None  # user took over — stop gliding
+                    else:
+                        cur = np.array(ik_ctrl.position)
+                        delta = move_glide - cur
+                        dist = float(np.linalg.norm(delta))
+                        step = _MOVE_SPEED_MPS * self._dt
+                        if dist <= step:
+                            ik_ctrl.position = move_glide
+                            move_glide = None
+                        else:
+                            ik_ctrl.position = cur + delta * (step / dist)
 
                 grip_target = bridge["gripper"]
                 bridge["gripper"] = None
