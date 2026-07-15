@@ -28,6 +28,7 @@ from i2rt.utils.camera_calibration import (
     mujoco_camera_to_opencv_transform,
     project_world_point,
 )
+from i2rt.utils.bridge_telemetry import sensorimotor_snapshot
 
 # Teaching-handle button indicator visuals (mirrors mujoco_control_interface.py)
 _BTN_OFF_RGB = (89, 89, 89)
@@ -389,7 +390,7 @@ class ViserControlInterface:
         import viser  # optional dependency — install with: pip install viser
 
         server = viser.ViserServer(port=self._port)
-        # local patch: minimal chrome so OneShotRobot can embed this as a clean viewport
+        # local patch: minimal chrome so Zeronce can embed this as a clean viewport
         server.gui.configure_theme(control_layout="collapsible", show_logo=False, show_share_button=False)
         print(f"[viser] Server started — open http://localhost:{self._port} in your browser")
         print("[viser] Starting in DISABLED (read-only) mode")
@@ -582,7 +583,7 @@ class ViserControlInterface:
                 self._kd = new_kd
                 print(f"[viser] Gains applied: kp={new_kp.tolist()}, kd={new_kd.tolist()}")
 
-        # ---- Local bridge (OneShotRobot) --------------------------------------
+        # ---- Local bridge (Zeronce) -------------------------------------------
         # Minimal HTTP endpoint so the web UI can request a reset-to-home.
         import io
         import json
@@ -825,6 +826,7 @@ class ViserControlInterface:
         prev_controlled = False
         reset_anim: dict | None = None
         move_glide: dict | None = None  # pending /move_to {target, speed} the gizmo glides toward
+        last_command = self._robot.get_joint_pos().copy()
         renderer: Optional[mujoco.Renderer] = None
         pose_data: Optional[mujoco.MjData] = None
         pose_cam: Optional[mujoco.MjvCamera] = None
@@ -925,15 +927,6 @@ class ViserControlInterface:
                             print("[bridge] Home pose reached")
                 self._mirror_robot()
                 self._update_scene(mesh_handles)
-
-                # Publish latest joint snapshot for the bridge's GET /joints
-                q_now = self._robot.get_joint_pos()
-                bridge["snapshot"] = {
-                    "t": time.time(),
-                    "joints": [float(v) for v in q_now[: self._n_arm]],
-                    "gripper": float(q_now[self._gripper_index]) if self._gripper_index is not None else 0.0,
-                    "objects": self._scene_object_snapshot(),
-                }
 
                 # Update EE frame indicator
                 T = self._ee_pose_4x4()
@@ -1096,6 +1089,7 @@ class ViserControlInterface:
                             self._in_collision = True
                     else:
                         self._robot.command_joint_pos(cmd)
+                        last_command = cmd.copy()
                         if self._in_collision:
                             print("[viser] Collision cleared — commands resumed")
                             self._in_collision = False
@@ -1119,9 +1113,21 @@ class ViserControlInterface:
                             self._in_collision = True
                     else:
                         self._robot.command_joint_pos(cmd)
+                        last_command = cmd.copy()
                         if self._in_collision:
                             print("[viser] Collision cleared — commands resumed")
                             self._in_collision = False
+
+                # The action at t is the absolute target just sent; it is not the
+                # next measured state. This matches LeRobot's canonical action.
+                bridge["snapshot"] = sensorimotor_snapshot(
+                    timestamp=time.time(),
+                    measured=self._robot.get_joint_pos(),
+                    commanded=last_command,
+                    arm_dofs=self._n_arm,
+                    gripper_index=self._gripper_index,
+                    objects=self._scene_object_snapshot(),
+                )
 
                 # Deadline pacing: sleep only the tick's remainder (idle behavior unchanged).
                 # While a camera stream is connected, pace the loop to 30Hz so streams
