@@ -534,6 +534,10 @@ class ViserControlInterface:
             "cam_req": {},
             "cam_jpg": {},
             "ee": None,
+            # MJPEG streaming: refcounted per camera; loop renders only while a client is connected
+            "stream_cond": threading.Condition(),
+            "stream_clients": {},
+            "stream_frame": {},
         }
         is_sim = self._is_sim
         _CAMERAS = ("overhead", "wrist")
@@ -581,6 +585,49 @@ class ViserControlInterface:
                 elif self.path == "/ee_pose":
                     ee = bridge["ee"]
                     self._json(200 if ee is not None else 503, ee if ee is not None else {"error": "no data yet"})
+                elif self.path.startswith("/camera/") and self.path.endswith("/stream"):
+                    name = self.path.split("/")[2]
+                    if name not in _CAMERAS:
+                        self._json(404, {"error": f"unknown camera {name!r}"})
+                        return
+                    cond = bridge["stream_cond"]
+                    with cond:
+                        bridge["stream_clients"][name] = bridge["stream_clients"].get(name, 0) + 1
+                    try:
+                        self.send_response(200)
+                        self._cors()
+                        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                        self.end_headers()
+                        last_seq = -1
+                        dry_spells = 0
+                        while dry_spells < 5:  # ~10s with no frames -> give up the connection
+                            with cond:
+                                got = cond.wait_for(
+                                    lambda: bridge["stream_frame"].get(name, (last_seq, None))[0] != last_seq,
+                                    timeout=2.0,
+                                )
+                                seq, jpg = bridge["stream_frame"].get(name, (last_seq, None))
+                            if not got or jpg is None:
+                                dry_spells += 1
+                                continue
+                            dry_spells = 0
+                            last_seq = seq
+                            self.wfile.write(
+                                b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                                + str(len(jpg)).encode()
+                                + b"\r\n\r\n"
+                            )
+                            self.wfile.write(jpg)
+                            self.wfile.write(b"\r\n")
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        pass  # client disconnected
+                    finally:
+                        with cond:
+                            n = bridge["stream_clients"].get(name, 1) - 1
+                            if n <= 0:
+                                bridge["stream_clients"].pop(name, None)
+                            else:
+                                bridge["stream_clients"][name] = n
                 elif self.path.startswith("/camera/"):
                     name = self.path.rsplit("/", 1)[1]
                     if name not in _CAMERAS:
@@ -664,6 +711,7 @@ class ViserControlInterface:
         renderer: Optional[mujoco.Renderer] = None
         try:
             while True:
+                tick_start = time.time()
                 if bridge["enable"]:
                     bridge["enable"] = False
                     if not state["enabled"]:
@@ -769,6 +817,29 @@ class ViserControlInterface:
                             bridge["cam_jpg"][cam_name] = None
                         ev.set()
 
+                # Render active MJPEG streams every tick (refcounted; zero cost when idle);
+                # the loop itself is paced to 30Hz while any stream is connected
+                stream_active = [c for c in _CAMERAS if bridge["stream_clients"].get(c)]
+                if stream_active:
+                    if renderer is None:
+                        try:
+                            renderer = mujoco.Renderer(self._model, height=480, width=640)
+                        except Exception as exc:
+                            print(f"[bridge] camera renderer init failed: {exc}")
+                            stream_active = []
+                    cond = bridge["stream_cond"]
+                    for cam_name in stream_active:
+                        try:
+                            renderer.update_scene(self._data, camera=cam_name)
+                            buf = io.BytesIO()
+                            PILImage.fromarray(renderer.render()).save(buf, "JPEG", quality=85)
+                            with cond:
+                                seq = bridge["stream_frame"].get(cam_name, (0, None))[0] + 1
+                                bridge["stream_frame"][cam_name] = (seq, buf.getvalue())
+                                cond.notify_all()
+                        except Exception as exc:
+                            print(f"[bridge] stream render {cam_name} failed: {exc}")
+
                 if self._with_teaching_handle:
                     handle_state = self._get_teaching_handle_state()
                     buttons = list(handle_state.io_inputs) if handle_state is not None else [False, False]
@@ -857,7 +928,11 @@ class ViserControlInterface:
                             print("[viser] Collision cleared — commands resumed")
                             self._in_collision = False
 
-                time.sleep(self._dt)
+                # Deadline pacing: sleep only the tick's remainder (idle behavior unchanged).
+                # While a camera stream is connected, pace the loop to 30Hz so streams
+                # deliver exactly one frame per tick at 30fps.
+                target_dt = max(self._dt, 1.0 / 30.0) if bridge["stream_clients"] else self._dt
+                time.sleep(max(0.0, target_dt - (time.time() - tick_start)))
 
         except KeyboardInterrupt:
             pass
