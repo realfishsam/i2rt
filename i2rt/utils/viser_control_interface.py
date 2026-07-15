@@ -533,6 +533,8 @@ class ViserControlInterface:
             "gripper": None,
             "cam_req": {},
             "cam_jpg": {},
+            "pose_req": None,  # (qpos_cmd list, Event) -> posed offline render
+            "pose_jpg": None,
             "ee": None,
             # MJPEG streaming: refcounted per camera; loop renders only while a client is connected
             "stream_cond": threading.Condition(),
@@ -585,6 +587,32 @@ class ViserControlInterface:
                 elif self.path == "/ee_pose":
                     ee = bridge["ee"]
                     self._json(200 if ee is not None else 503, ee if ee is not None else {"error": "no data yet"})
+                elif self.path.startswith("/render"):
+                    # GET /render?joints=j1,...,j6&gripper=g -> JPEG of the arm posed at
+                    # those angles (offline scratch data; never disturbs the live sim)
+                    from urllib.parse import parse_qs, urlparse
+
+                    q = parse_qs(urlparse(self.path).query)
+                    try:
+                        joints = [float(x) for x in q["joints"][0].split(",")]
+                        gripper = float(q.get("gripper", ["0"])[0])
+                        if len(joints) != 6:
+                            raise ValueError
+                    except (KeyError, ValueError):
+                        self._json(400, {"error": "expected joints=j1,..,j6&gripper=g"})
+                        return
+                    ev = threading.Event()
+                    bridge["pose_req"] = (joints + [gripper], ev)
+                    jpg = bridge["pose_jpg"] if ev.wait(2.0) else None
+                    if jpg:
+                        self.send_response(200)
+                        self._cors()
+                        self.send_header("Content-Type", "image/jpeg")
+                        self.send_header("Content-Length", str(len(jpg)))
+                        self.end_headers()
+                        self.wfile.write(jpg)
+                    else:
+                        self._json(503, {"error": "render unavailable"})
                 elif self.path.startswith("/camera/") and self.path.endswith("/stream"):
                     name = self.path.split("/")[2]
                     if name not in _CAMERAS:
@@ -709,6 +737,8 @@ class ViserControlInterface:
         prev_controlled = False
         reset_anim: dict | None = None
         renderer: Optional[mujoco.Renderer] = None
+        pose_data: Optional[mujoco.MjData] = None
+        pose_cam: Optional[mujoco.MjvCamera] = None
         try:
             while True:
                 tick_start = time.time()
@@ -816,6 +846,41 @@ class ViserControlInterface:
                             print(f"[bridge] camera {cam_name} render failed: {exc}")
                             bridge["cam_jpg"][cam_name] = None
                         ev.set()
+
+                # Service posed offline renders (/render?joints=...) on a scratch MjData
+                if bridge["pose_req"] is not None:
+                    q_cmd, pose_ev = bridge["pose_req"]
+                    bridge["pose_req"] = None
+                    if renderer is None:
+                        try:
+                            renderer = mujoco.Renderer(self._model, height=480, width=640)
+                        except Exception as exc:
+                            print(f"[bridge] pose renderer init failed: {exc}")
+                    if renderer is None:
+                        bridge["pose_jpg"] = None
+                        pose_ev.set()
+                    else:
+                        try:
+                            if pose_data is None:
+                                pose_data = mujoco.MjData(self._model)
+                                pose_cam = mujoco.MjvCamera()
+                                pose_cam.azimuth, pose_cam.elevation = 140.0, -25.0
+                                pose_cam.distance = 1.1
+                                pose_cam.lookat[:] = [0.25, 0.0, 0.15]
+                            n = min(len(q_cmd), self._nq)
+                            pose_data.qpos[:] = self._data.qpos  # keep object poses current
+                            pose_data.qpos[:n] = q_cmd[:n]
+                            self._denormalize_slide_joints_on(pose_data, n)
+                            self._enforce_eq_constraints_on(pose_data)
+                            mujoco.mj_forward(self._model, pose_data)
+                            renderer.update_scene(pose_data, camera=pose_cam)
+                            buf = io.BytesIO()
+                            PILImage.fromarray(renderer.render()).save(buf, "JPEG", quality=85)
+                            bridge["pose_jpg"] = buf.getvalue()
+                        except Exception as exc:
+                            print(f"[bridge] pose render failed: {exc}")
+                            bridge["pose_jpg"] = None
+                        pose_ev.set()
 
                 # Render active MJPEG streams every tick (refcounted; zero cost when idle);
                 # the loop itself is paced to 30Hz while any stream is connected
