@@ -23,6 +23,11 @@ from i2rt.motor_drivers.dm_driver import PassiveEncoderInfo
 from i2rt.robots.kinematics import Kinematics
 from i2rt.robots.motor_chain_robot import MotorChainRobot
 from i2rt.robots.robot import Robot
+from i2rt.utils.camera_calibration import (
+    camera_intrinsics_from_fovy,
+    mujoco_camera_to_opencv_transform,
+    project_world_point,
+)
 
 # Teaching-handle button indicator visuals (mirrors mujoco_control_interface.py)
 _BTN_OFF_RGB = (89, 89, 89)
@@ -33,6 +38,8 @@ _BTN_Z_OFFSETS = [0.10, 0.04]
 _BTN_LABELS = ["SYNC", "RECORD"]
 _RESET_RAMP_S = 2.0  # seconds to glide from current pose to home on /reset
 _MOVE_SPEED_MPS = 0.25  # cartesian glide speed for /move_to — approximates real-arm pace instead of teleporting
+_CAMERA_WIDTH = 640
+_CAMERA_HEIGHT = 480
 # "forward" = Ry(90) horizontal default; "down" = Ry(180), pitched past horizontal toward the floor —
 # the identity-quat "down" variant is only reachable folded above the base, this one works out front
 _ORIENT_PRESETS = {"down": [0.0, 0.0, 1.0, 0.0], "forward": [0.7071068, 0.0, 0.7071068, 0.0]}
@@ -236,6 +243,27 @@ class ViserControlInterface:
         T[:3, 3] = site.xpos.copy()
         T[:3, :3] = site.xmat.reshape(3, 3)
         return T
+
+    def _camera_calibration_snapshot(self, camera_name: str, width: int, height: int) -> Dict[str, Any]:
+        """Return synchronized simulator geometry for one camera and the TCP."""
+        camera_id = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_CAMERA, camera_name)
+        if camera_id == -1:
+            raise ValueError(f"camera {camera_name!r} not found in model")
+        intrinsics = camera_intrinsics_from_fovy(width, height, float(self._model.cam_fovy[camera_id]))
+        world_to_camera = mujoco_camera_to_opencv_transform(
+            self._data.cam_xpos[camera_id],
+            self._data.cam_xmat[camera_id].reshape(3, 3),
+        )
+        tcp_world = self._data.site(self._ee_site_id).xpos.copy()
+        tcp_pixel = project_world_point(tcp_world, world_to_camera, intrinsics)
+        return {
+            "camera": camera_name,
+            "width": width,
+            "height": height,
+            "camera_intrinsics": intrinsics.tolist(),
+            "reference": {"name": "tcp", "world": tcp_world.tolist(), "pixel": tcp_pixel.tolist()},
+            "ground_truth_world_to_camera": world_to_camera.tolist(),
+        }
 
     # ---- Mesh extraction ------------------------------------------------------
 
@@ -553,6 +581,7 @@ class ViserControlInterface:
             "pose_req": None,  # (qpos_cmd list, Event) -> posed offline render
             "pose_jpg": None,
             "ee": None,
+            "calibration": {},
             # MJPEG streaming: refcounted per camera; loop renders only while a client is connected
             "stream_cond": threading.Condition(),
             "stream_clients": {},
@@ -604,6 +633,19 @@ class ViserControlInterface:
                 elif self.path == "/ee_pose":
                     ee = bridge["ee"]
                     self._json(200 if ee is not None else 503, ee if ee is not None else {"error": "no data yet"})
+                elif self.path.startswith("/camera/") and self.path.endswith("/calibration"):
+                    name = self.path.split("/")[2]
+                    if name not in _CAMERAS:
+                        self._json(404, {"error": f"unknown camera {name!r}"})
+                        return
+                    if not is_sim:
+                        self._json(403, {"error": "simulator calibration truth is unavailable on real hardware"})
+                        return
+                    calibration = bridge["calibration"].get(name)
+                    self._json(
+                        200 if calibration is not None else 503,
+                        calibration if calibration is not None else {"error": "no calibration data yet"},
+                    )
                 elif self.path.startswith("/render"):
                     # GET /render?joints=j1,...,j6&gripper=g -> JPEG of the arm posed at
                     # those angles (offline scratch data; never disturbs the live sim)
@@ -880,12 +922,21 @@ class ViserControlInterface:
                     "pos": [float(v) for v in T[:3, 3]],
                     "wxyz": [float(v) for v in self._mat3_to_wxyz(T[:3, :3])],
                 }
+                if is_sim:
+                    bridge["calibration"] = {
+                        camera_name: self._camera_calibration_snapshot(
+                            camera_name,
+                            width=_CAMERA_WIDTH,
+                            height=_CAMERA_HEIGHT,
+                        )
+                        for camera_name in _CAMERAS
+                    }
 
                 # Service camera snapshot requests (render on this thread — GL context affinity)
                 if bridge["cam_req"]:
                     if renderer is None:
                         try:
-                            renderer = mujoco.Renderer(self._model, height=480, width=640)
+                            renderer = mujoco.Renderer(self._model, height=_CAMERA_HEIGHT, width=_CAMERA_WIDTH)
                         except Exception as exc:
                             print(f"[bridge] camera renderer init failed: {exc}")
                             for cam_name, ev in list(bridge["cam_req"].items()):
@@ -910,7 +961,7 @@ class ViserControlInterface:
                     bridge["pose_req"] = None
                     if renderer is None:
                         try:
-                            renderer = mujoco.Renderer(self._model, height=480, width=640)
+                            renderer = mujoco.Renderer(self._model, height=_CAMERA_HEIGHT, width=_CAMERA_WIDTH)
                         except Exception as exc:
                             print(f"[bridge] pose renderer init failed: {exc}")
                     if renderer is None:
@@ -945,7 +996,7 @@ class ViserControlInterface:
                 if stream_active:
                     if renderer is None:
                         try:
-                            renderer = mujoco.Renderer(self._model, height=480, width=640)
+                            renderer = mujoco.Renderer(self._model, height=_CAMERA_HEIGHT, width=_CAMERA_WIDTH)
                         except Exception as exc:
                             print(f"[bridge] camera renderer init failed: {exc}")
                             stream_active = []
