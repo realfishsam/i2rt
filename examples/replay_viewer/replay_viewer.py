@@ -4,7 +4,7 @@ Loads the same generated scene MJCF the sim uses (arm + floor + cube), serves an
 interactive viser scene on --port (default 8082) with NO control widgets, and
 accepts poses on a tiny HTTP endpoint on --pose-port (default 8083):
 
-    POST /pose {"joints": [j1..j6], "gripper": 0..1}
+    POST /pose {"joints": [j1..j6], "gripper": 0..1, "objects": [{"name": ..., "pos": [...], "wxyz": [...]}]}
 
 The OneShotRobot replay page embeds the viser viewport (iframe name="mirror",
 which the locally patched viser client build renders chrome-free) and streams
@@ -16,6 +16,7 @@ Run:  python examples/replay_viewer/replay_viewer.py
 import argparse
 import glob
 import json
+import math
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -53,6 +54,12 @@ class ReplayViewer:
 
         free = [j for j in range(self._model.njnt) if self._model.jnt_type[j] == mujoco.mjtJoint.mjJNT_FREE]
         self._free_qpos_start = min((int(self._model.jnt_qposadr[j]) for j in free), default=self._model.nq)
+        self._free_qpos_by_body_name = {
+            str(mujoco.mj_id2name(self._model, mujoco.mjtObj.mjOBJ_BODY, int(self._model.jnt_bodyid[j]))): int(
+                self._model.jnt_qposadr[j]
+            )
+            for j in free
+        }
 
         self._mesh_geom_ids: List[int] = []
         self._box_geom_ids: List[int] = []
@@ -62,7 +69,7 @@ class ReplayViewer:
 
     # ---- qpos plumbing (mirrors ViserControlInterface conventions) -----------
 
-    def _apply_pose(self, joints: List[float], gripper: float) -> None:
+    def _apply_pose(self, joints: List[float], gripper: float, objects: List[Dict[str, Any]]) -> None:
         vec = list(joints) + [gripper]
         n = min(len(vec), self._free_qpos_start)
         self._data.qpos[:n] = vec[:n]
@@ -80,7 +87,55 @@ class ReplayViewer:
             adr2 = self._model.jnt_qposadr[self._model.eq_obj2id[i]]
             coef = self._model.eq_data[i, :5]
             self._data.qpos[adr2] = np.polyval(coef[::-1], self._data.qpos[adr1])
+        for obj in objects:
+            address = self._free_qpos_by_body_name.get(obj["name"])
+            if address is None:
+                continue
+            self._data.qpos[address : address + 7] = [*obj["pos"], *obj["wxyz"]]
         mujoco.mj_forward(self._model, self._data)
+
+    @staticmethod
+    def _parse_objects(value: Any) -> List[Dict[str, Any]]:
+        if value is None:
+            return []
+        if not isinstance(value, list) or len(value) > 100:
+            raise ValueError("objects must be a list of at most 100 poses")
+        objects: List[Dict[str, Any]] = []
+        for item in value:
+            if not isinstance(item, dict):
+                raise ValueError("object pose must be an object")
+            name, pos, wxyz = item.get("name"), item.get("pos"), item.get("wxyz")
+            if not isinstance(name, str) or not name or len(name) > 128:
+                raise ValueError("object pose name is invalid")
+            if not isinstance(pos, list) or len(pos) != 3 or not isinstance(wxyz, list) or len(wxyz) != 4:
+                raise ValueError("object pose must have pos[3] and wxyz[4]")
+            values = [float(component) for component in [*pos, *wxyz]]
+            if not all(math.isfinite(component) for component in values):
+                raise ValueError("object pose values must be finite")
+            quaternion_norm = math.sqrt(sum(component * component for component in values[3:]))
+            if quaternion_norm < 1e-8:
+                raise ValueError("object pose quaternion must be nonzero")
+            objects.append(
+                {
+                    "name": name,
+                    "pos": values[:3],
+                    "wxyz": [component / quaternion_norm for component in values[3:]],
+                }
+            )
+        return objects
+
+    @staticmethod
+    def _parse_pose_payload(value: Any) -> tuple[List[float], float, List[Dict[str, Any]]]:
+        if not isinstance(value, dict):
+            raise ValueError("pose payload must be an object")
+        raw_joints = value.get("joints")
+        if not isinstance(raw_joints, list) or len(raw_joints) > 100:
+            raise ValueError("joints must be a list of at most 100 values")
+        joints = [float(component) for component in raw_joints]
+        gripper = float(value.get("gripper", 0.0))
+        if not all(math.isfinite(component) for component in [*joints, gripper]):
+            raise ValueError("joint and gripper values must be finite")
+        return joints, gripper, ReplayViewer._parse_objects(value.get("objects"))
 
     # ---- viser scene ----------------------------------------------------------
 
@@ -157,13 +212,20 @@ class ReplayViewer:
                     return
                 try:
                     length = int(self.headers.get("Content-Length", "0"))
+                    if length <= 0 or length > 65_536:
+                        raise ValueError("pose body size is invalid")
                     payload = json.loads(self.rfile.read(length))
-                    joints = [float(v) for v in payload["joints"]]
-                    gripper = float(payload.get("gripper", 0.0))
+                    joints, gripper, objects = ReplayViewer._parse_pose_payload(payload)
                 except (TypeError, KeyError, ValueError, json.JSONDecodeError):
-                    self._json(400, {"ok": False, "error": 'body must be {"joints": [...], "gripper": 0..1}'})
+                    self._json(
+                        400,
+                        {
+                            "ok": False,
+                            "error": 'body must contain finite "joints", "gripper", and optional object poses',
+                        },
+                    )
                     return
-                pending["pose"] = (joints, gripper)
+                pending["pose"] = (joints, gripper, objects)
                 self._json(200, {"ok": True})
 
             def log_message(self, *args: object) -> None:

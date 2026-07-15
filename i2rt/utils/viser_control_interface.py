@@ -178,6 +178,27 @@ class ViserControlInterface:
             coef = self._model.eq_data[i, :5]
             data.qpos[adr2] = np.polyval(coef[::-1], data.qpos[adr1])
 
+    def _scene_object_snapshot(self) -> List[Dict[str, Any]]:
+        """Serialize free-joint bodies for synchronized episode replay."""
+        objects: List[Dict[str, Any]] = []
+        for joint_id in range(self._model.njnt):
+            if self._model.jnt_type[joint_id] != mujoco.mjtJoint.mjJNT_FREE:
+                continue
+            body_id = int(self._model.jnt_bodyid[joint_id])
+            body_name = mujoco.mj_id2name(self._model, mujoco.mjtObj.mjOBJ_BODY, body_id)
+            if body_name is None:
+                continue
+            address = int(self._model.jnt_qposadr[joint_id])
+            pose = self._data.qpos[address : address + 7]
+            objects.append(
+                {
+                    "name": body_name,
+                    "pos": [float(value) for value in pose[:3]],
+                    "wxyz": [float(value) for value in pose[3:]],
+                }
+            )
+        return objects
+
     def _has_self_collision(self, target_q: np.ndarray, n: int) -> bool:
         """Return True if *target_q* would cause self-collision.
 
@@ -911,6 +932,7 @@ class ViserControlInterface:
                     "t": time.time(),
                     "joints": [float(v) for v in q_now[: self._n_arm]],
                     "gripper": float(q_now[self._gripper_index]) if self._gripper_index is not None else 0.0,
+                    "objects": self._scene_object_snapshot(),
                 }
 
                 # Update EE frame indicator
