@@ -33,6 +33,22 @@ _BTN_Z_OFFSETS = [0.10, 0.04]
 _BTN_LABELS = ["SYNC", "RECORD"]
 _RESET_RAMP_S = 2.0  # seconds to glide from current pose to home on /reset
 _MOVE_SPEED_MPS = 0.25  # cartesian glide speed for /move_to — approximates real-arm pace instead of teleporting
+# "forward" = Ry(90) horizontal default; "down" = Ry(180), pitched past horizontal toward the floor —
+# the identity-quat "down" variant is only reachable folded above the base, this one works out front
+_ORIENT_PRESETS = {"down": [0.0, 0.0, 1.0, 0.0], "forward": [0.7071068, 0.0, 0.7071068, 0.0]}
+
+
+def _slerp(q0: np.ndarray, q1: np.ndarray, t: float) -> np.ndarray:
+    q0 = q0 / np.linalg.norm(q0)
+    q1 = q1 / np.linalg.norm(q1)
+    d = float(np.dot(q0, q1))
+    if d < 0.0:
+        q1, d = -q1, -d
+    if d > 0.9995:
+        q = q0 + t * (q1 - q0)
+        return q / np.linalg.norm(q)
+    th = np.arccos(d)
+    return (np.sin((1.0 - t) * th) * q0 + np.sin(t * th) * q1) / np.sin(th)
 
 
 class ViserControlInterface:
@@ -691,14 +707,21 @@ class ViserControlInterface:
                     try:
                         target = [float(body["x"]), float(body["y"]), float(body["z"])]  # type: ignore[index]
                         speed = min(0.6, max(0.02, float(body.get("speed", _MOVE_SPEED_MPS))))  # type: ignore[union-attr]
+                        orient = body.get("orient")  # type: ignore[union-attr]
+                        if isinstance(orient, str):
+                            orient = _ORIENT_PRESETS[orient]
+                        elif orient is not None:
+                            orient = [float(v) for v in orient]
+                            if len(orient) != 4:
+                                raise ValueError("orient quaternion must be [w, x, y, z]")
                     except (TypeError, KeyError, ValueError):
-                        self._json(400, {"ok": False, "error": "body must be {x, y, z, speed?}"})
+                        self._json(400, {"ok": False, "error": 'body must be {x, y, z, speed?, orient?: "down" | "forward" | [w,x,y,z]}'})
                         return
                     # bridge["enable"] covers the gap between POST /enable and the loop consuming it
                     if not (state["enabled"] or bridge["enable"]):
                         self._json(409, {"ok": False, "error": "robot disabled"})
                         return
-                    bridge["move_to"] = (target, speed)
+                    bridge["move_to"] = (target, speed, orient)
                     self._json(202, {"ok": True})
                 elif self.path == "/gripper":
                     body = self._body()
@@ -766,22 +789,39 @@ class ViserControlInterface:
                 if move_msg is not None and state["enabled"]:
                     if mode_dd.value != "IK control":
                         mode_dd.value = "IK control"  # fires on_update: gizmo shown, snapped to current EE
-                    move_glide = {"target": np.array(move_msg[0]), "speed": move_msg[1]}
-                    print(f"[bridge] move_to {move_msg[0]} (gliding at {move_msg[1]} m/s)")
+                    target_pos, speed, target_q = move_msg
+                    # anchor the glide at the PHYSICAL end-effector pose — the gizmo can be
+                    # stale when mode was already IK, and a stale start teleports the target
+                    start_pos = np.array(self._data.site_xpos[self._ee_site_id])
+                    start_q = np.zeros(4)
+                    mujoco.mju_mat2Quat(start_q, self._data.site_xmat[self._ee_site_id].reshape(9))
+                    ik_ctrl.position = start_pos
+                    ik_ctrl.wxyz = start_q
+                    move_glide = {
+                        "start_pos": start_pos,
+                        "target_pos": np.array(target_pos),
+                        "start_q": start_q,
+                        "target_q": start_q if target_q is None else np.array(target_q, dtype=float),
+                        "speed": speed,
+                        "total": float(np.linalg.norm(np.array(target_pos) - start_pos)),
+                        "s": 0.0,
+                    }
+                    print(f"[bridge] move_to {target_pos} orient={target_q or 'kept'} (gliding at {speed} m/s)")
 
                 if move_glide is not None:
                     if not state["enabled"] or state["mode"] != "ik":
                         move_glide = None  # user took over — stop gliding
                     else:
-                        cur = np.array(ik_ctrl.position)
-                        delta = move_glide["target"] - cur
-                        dist = float(np.linalg.norm(delta))
-                        step = move_glide["speed"] * self._dt
-                        if dist <= step:
-                            ik_ctrl.position = move_glide["target"]
-                            move_glide = None
+                        if move_glide["total"] > 1e-6:
+                            ds = move_glide["speed"] * self._dt / move_glide["total"]
                         else:
-                            ik_ctrl.position = cur + delta * (step / dist)
+                            ds = self._dt / 1.5  # pure rotation — pace it over ~1.5s
+                        move_glide["s"] = min(1.0, move_glide["s"] + ds)
+                        frac = move_glide["s"]
+                        ik_ctrl.position = move_glide["start_pos"] + (move_glide["target_pos"] - move_glide["start_pos"]) * frac
+                        ik_ctrl.wxyz = _slerp(move_glide["start_q"], move_glide["target_q"], frac)
+                        if frac >= 1.0:
+                            move_glide = None
 
                 grip_target = bridge["gripper"]
                 bridge["gripper"] = None
