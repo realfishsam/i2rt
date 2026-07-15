@@ -690,14 +690,15 @@ class ViserControlInterface:
                     body = self._body()
                     try:
                         target = [float(body["x"]), float(body["y"]), float(body["z"])]  # type: ignore[index]
+                        speed = min(0.6, max(0.02, float(body.get("speed", _MOVE_SPEED_MPS))))  # type: ignore[union-attr]
                     except (TypeError, KeyError, ValueError):
-                        self._json(400, {"ok": False, "error": "body must be {x, y, z}"})
+                        self._json(400, {"ok": False, "error": "body must be {x, y, z, speed?}"})
                         return
                     # bridge["enable"] covers the gap between POST /enable and the loop consuming it
                     if not (state["enabled"] or bridge["enable"]):
                         self._json(409, {"ok": False, "error": "robot disabled"})
                         return
-                    bridge["move_to"] = target
+                    bridge["move_to"] = (target, speed)
                     self._json(202, {"ok": True})
                 elif self.path == "/gripper":
                     body = self._body()
@@ -737,7 +738,7 @@ class ViserControlInterface:
         # ---- Main loop -------------------------------------------------------
         prev_controlled = False
         reset_anim: dict | None = None
-        move_glide: Optional[np.ndarray] = None  # pending /move_to target the gizmo glides toward
+        move_glide: dict | None = None  # pending /move_to {target, speed} the gizmo glides toward
         renderer: Optional[mujoco.Renderer] = None
         pose_data: Optional[mujoco.MjData] = None
         pose_cam: Optional[mujoco.MjvCamera] = None
@@ -760,24 +761,24 @@ class ViserControlInterface:
                         if gripper_slider is not None and self._gripper_index is not None:
                             gripper_slider.value = float(q[self._gripper_index])
 
-                move_target = bridge["move_to"]
+                move_msg = bridge["move_to"]
                 bridge["move_to"] = None
-                if move_target is not None and state["enabled"]:
+                if move_msg is not None and state["enabled"]:
                     if mode_dd.value != "IK control":
                         mode_dd.value = "IK control"  # fires on_update: gizmo shown, snapped to current EE
-                    move_glide = np.array(move_target)
-                    print(f"[bridge] move_to {move_target} (gliding at {_MOVE_SPEED_MPS} m/s)")
+                    move_glide = {"target": np.array(move_msg[0]), "speed": move_msg[1]}
+                    print(f"[bridge] move_to {move_msg[0]} (gliding at {move_msg[1]} m/s)")
 
                 if move_glide is not None:
                     if not state["enabled"] or state["mode"] != "ik":
                         move_glide = None  # user took over — stop gliding
                     else:
                         cur = np.array(ik_ctrl.position)
-                        delta = move_glide - cur
+                        delta = move_glide["target"] - cur
                         dist = float(np.linalg.norm(delta))
-                        step = _MOVE_SPEED_MPS * self._dt
+                        step = move_glide["speed"] * self._dt
                         if dist <= step:
-                            ik_ctrl.position = move_glide
+                            ik_ctrl.position = move_glide["target"]
                             move_glide = None
                         else:
                             ik_ctrl.position = cur + delta * (step / dist)
