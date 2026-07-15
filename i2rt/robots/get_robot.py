@@ -243,7 +243,9 @@ def get_yam_robot(
             friction="1 0.005 0.0001",
         )
         ET.SubElement(scene_wb, "light", name="toplight", pos="0.3 0.2 1.5", dir="0 0 -1", diffuse="0.45 0.45 0.45", specular="0.1 0.1 0.1")
-        ET.SubElement(scene_wb, "camera", name="overhead", pos="0.30 0 0.9", xyaxes="0 -1 0 1 0 0", fovy="55")
+        # elevated 3/4 view, not straight-down: an oblique exo camera sees layout AND height,
+        # matching how the real workspace camera should be mounted
+        ET.SubElement(scene_wb, "camera", name="overhead", pos="0.33 -0.75 0.55", xyaxes="1 0 0 0 0.555 0.832", fovy="45")
         gripper_body = scene_tree.getroot().find(".//body[@name='gripper']")
         if gripper_body is not None:
             # finger (+Y) side of the mount, pitched at grasp_site (0,0,-0.1347) so the
